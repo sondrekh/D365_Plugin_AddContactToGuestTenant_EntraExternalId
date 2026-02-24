@@ -28,7 +28,7 @@ namespace CIAMPlugins
             ITracingService tracer = (ITracingService)serviceProvider.GetService(typeof(ITracingService));
             IPluginExecutionContext context = (IPluginExecutionContext)serviceProvider.GetService(typeof(IPluginExecutionContext));
 
-            // Ensure TLS 1.2 for communication with Microsoft Graph
+            // Ensure use of TLS 1.2 for communication with Microsoft Graph
             ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12;
 
             // Prevent infinite loops
@@ -43,7 +43,7 @@ namespace CIAMPlugins
             if (!context.InputParameters.Contains("Target") || !(context.InputParameters["Target"] is Entity targetEntity))
                 return;
 
-            // Use PostImage for robust data access, fallback to Target
+            // Use PostImage for robust data access, fall back to Target
             Entity contact = context.PostEntityImages.Contains("PostImage")
                 ? context.PostEntityImages["PostImage"]
                 : targetEntity;
@@ -77,7 +77,7 @@ namespace CIAMPlugins
 
                     string accessToken = GetGraphAccessToken(httpClient, tenantId, clientId, clientSecret);
 
-                    // 1. Attempt to create the user
+                    // 1. Try to create the user or retrieve the existing one
                     string userId = ProvisionUserInGraph(httpClient, accessToken, email, contact, domain, tracer);
 
                     // 2. Add to security group if configured
@@ -89,7 +89,7 @@ namespace CIAMPlugins
             }
             catch (InvalidPluginExecutionException ex)
             {
-                // Directly re-throw to ensure the UI catches the user-friendly message
+                // Rethrow to ensure the UI catches explicit errors
                 throw ex;
             }
             catch (Exception ex)
@@ -117,8 +117,21 @@ namespace CIAMPlugins
         {
             client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
 
-            string firstName = contact.GetAttributeValue<string>("firstname") ?? "";
-            string lastName = contact.GetAttributeValue<string>("lastname") ?? "User";
+            // Microsoft Graph requires givenName and surname (1-64 characters)
+            string firstName = contact.GetAttributeValue<string>("firstname");
+            string lastName = contact.GetAttributeValue<string>("lastname");
+
+            // Fallback logic for missing names to avoid BadRequest
+            if (string.IsNullOrWhiteSpace(firstName))
+            {
+                firstName = email.Split('@')[0];
+                if (firstName.Length > 64) firstName = firstName.Substring(0, 64);
+            }
+
+            if (string.IsNullOrWhiteSpace(lastName))
+            {
+                lastName = "User";
+            }
 
             var userPayload = new
             {
@@ -147,18 +160,34 @@ namespace CIAMPlugins
                 return JObject.Parse(responseBody)["id"].ToString();
             }
 
-            // Handle standard Conflict (409)
-            if (response.StatusCode == HttpStatusCode.Conflict)
+            // Specific handling for proxyAddresses conflict: log a warning and allow save to continue
+            // (This should not throw an error that rolls back the CRM operation)
+            if (response.StatusCode == HttpStatusCode.BadRequest &&
+                (responseBody.Contains("proxyAddresses") || responseBody.Contains("Another object with the same value for property proxyAddresses")))
             {
-                tracer.Trace($"Conflict: User with email {email} already exists.");
-                throw new InvalidPluginExecutionException($"A user with the email address '{email}' is already registered in Entra External Id.");
+                tracer.Trace($"Warning: Proxy address conflict detected for {email}. Details: {responseBody}");
+                // Return null to indicate the user was not created here, but allow the plugin to complete without throwing
+                return null;
             }
 
-            // Handle BadRequest (400) that contains "already exists" or "ObjectConflict"
-            if (response.StatusCode == HttpStatusCode.BadRequest && responseBody.Contains("already exists"))
+            // Handle cases where the user already exists
+            // 409 Conflict: Standard response for duplicates
+            // 400 BadRequest: Happens in CIAM when proxyAddresses or identities conflict
+            if (response.StatusCode == HttpStatusCode.Conflict ||
+               (response.StatusCode == HttpStatusCode.BadRequest && responseBody.Contains("already exists")))
             {
-                tracer.Trace($"BadRequest Conflict: Object already exists for {email}. Raw response: {responseBody}");
-                throw new InvalidPluginExecutionException($"A user with the email address '{email}' is already registered in Entra External Id.");
+                tracer.Trace($"User {email} already exists or has a conflict. Fetching existing ID.");
+
+                // Fetch existing user ID via filter to continue the process
+                var filterUrl = $"https://graph.microsoft.com/v1.0/users?$filter=identities/any(id:id/issuerAssignedId eq '{email}')&$select=id";
+                var getResponse = client.GetAsync(filterUrl).Result;
+
+                if (getResponse.IsSuccessStatusCode)
+                {
+                    var searchResult = JObject.Parse(getResponse.Content.ReadAsStringAsync().Result);
+                    var users = (JArray)searchResult["value"];
+                    if (users.Count > 0) return users[0]["id"].ToString();
+                }
             }
 
             throw new Exception($"Failed to handle user in Graph: {response.StatusCode} - {responseBody}");
