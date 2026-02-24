@@ -17,10 +17,93 @@ namespace CIAMPlugins
     public class CreateCiamUser : IPlugin
     {
         private readonly string _secureConfig;
+        private readonly string _unsecureConfig;
 
         public CreateCiamUser(string unsecureConfig, string secureConfig)
         {
+            _unsecureConfig = unsecureConfig;
             _secureConfig = secureConfig;
+        }
+
+        private void DeleteUserFromGraph(HttpClient client, string accessToken, string email, ITracingService tracer)
+        {
+            try
+            {
+                client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
+
+                var safeEmail = (email ?? string.Empty).Replace("'", "''");
+
+                // Try locating the user by mail, then otherMails, then identities
+                JArray users = null;
+
+                // Search by mail
+                var mailFilterUrl = $"https://graph.microsoft.com/v1.0/users?$filter=mail eq '{safeEmail}'&$select=id";
+                var mailGet = client.GetAsync(mailFilterUrl).Result;
+                if (mailGet.IsSuccessStatusCode)
+                {
+                    var mailResult = JObject.Parse(mailGet.Content.ReadAsStringAsync().Result);
+                    users = (JArray)mailResult["value"];
+                }
+
+                // If not found, search by otherMails
+                if (users == null || users.Count == 0)
+                {
+                    var otherMailsFilter = $"https://graph.microsoft.com/v1.0/users?$filter=otherMails/any(m:m eq '{safeEmail}')&$select=id";
+                    var otherGet = client.GetAsync(otherMailsFilter).Result;
+                    if (otherGet.IsSuccessStatusCode)
+                    {
+                        var otherResult = JObject.Parse(otherGet.Content.ReadAsStringAsync().Result);
+                        users = (JArray)otherResult["value"];
+                    }
+                }
+
+                // If still not found, fallback to identities lookup
+                if (users == null || users.Count == 0)
+                {
+                    var identitiesFilterLocal = $"https://graph.microsoft.com/v1.0/users?$filter=identities/any(id:id/issuerAssignedId eq '{safeEmail}')&$select=id";
+                    var idGetLocal = client.GetAsync(identitiesFilterLocal).Result;
+                    if (idGetLocal.IsSuccessStatusCode)
+                    {
+                        var idResultLocal = JObject.Parse(idGetLocal.Content.ReadAsStringAsync().Result);
+                        users = (JArray)idResultLocal["value"];
+                    }
+                }
+
+                if (users == null || users.Count == 0)
+                {
+                    tracer.Trace($"Info: No Entra user found for {email}; nothing to delete.");
+                    return;
+                }
+
+                var userId = users[0]["id"].ToString();
+
+                // Delete the user
+                var deleteUrl = $"https://graph.microsoft.com/v1.0/users/{userId}";
+                var deleteResponse = client.DeleteAsync(deleteUrl).Result;
+
+                if (deleteResponse.IsSuccessStatusCode)
+                {
+                    tracer.Trace($"Success: User {email} (id: {userId}) deleted from Entra.");
+                }
+                else if (deleteResponse.StatusCode == HttpStatusCode.NotFound)
+                {
+                    tracer.Trace($"Info: User {email} not found when attempting delete.");
+                }
+                else if (deleteResponse.StatusCode == HttpStatusCode.Forbidden)
+                {
+                    var responseBody = deleteResponse.Content.ReadAsStringAsync().Result;
+                    tracer.Trace($"Warning: Forbidden deleting user {email}. Response: {responseBody}");
+                }
+                else
+                {
+                    var responseBody = deleteResponse.Content.ReadAsStringAsync().Result;
+                    tracer.Trace($"Warning: Could not delete user {email}. Status: {deleteResponse.StatusCode}. Response: {responseBody}");
+                }
+            }
+            catch (Exception ex)
+            {
+                tracer.Trace($"Warning: Exception while deleting user {email} from Entra: {ex.Message}");
+            }
         }
 
         public void Execute(IServiceProvider serviceProvider)
@@ -64,6 +147,43 @@ namespace CIAMPlugins
                 string domain = config["tenantDomain"]?.ToString();
                 string groupId = config["groupId"]?.ToString();
 
+                // Read unsecure config to get the logical name of the boolean field that indicates portal enablement
+                string isEnabledForPortalField = null;
+                if (!string.IsNullOrEmpty(_unsecureConfig))
+                {
+                    try
+                    {
+                        var unsecure = JObject.Parse(_unsecureConfig);
+                        isEnabledForPortalField = unsecure["isEnabledForPortalField"]?.ToString();
+                    }
+                    catch (Exception ex)
+                    {
+                        tracer.Trace($"Warning: Failed to parse unsecure configuration: {ex.Message}");
+                    }
+                }
+
+                // Determine the contact's portal-enabled flag (if configured)
+                bool? isPortalEnabled = null;
+                if (!string.IsNullOrEmpty(isEnabledForPortalField))
+                {
+                    if (contact.Attributes.Contains(isEnabledForPortalField))
+                    {
+                        try
+                        {
+                            // CRM boolean fields are represented as bool
+                            isPortalEnabled = contact.GetAttributeValue<bool?>(isEnabledForPortalField);
+                        }
+                        catch
+                        {
+                            tracer.Trace($"Warning: Attribute '{isEnabledForPortalField}' exists but could not be read as a boolean.");
+                        }
+                    }
+                    else
+                    {
+                        tracer.Trace($"Info: Contact does not contain attribute '{isEnabledForPortalField}'. Proceeding with default behavior.");
+                    }
+                }
+
                 if (new[] { tenantId, clientId, clientSecret, domain }.Any(string.IsNullOrEmpty))
                 {
                     throw new InvalidPluginExecutionException("Configuration Error: Missing required fields in Secure Configuration.");
@@ -77,13 +197,26 @@ namespace CIAMPlugins
 
                     string accessToken = GetGraphAccessToken(httpClient, tenantId, clientId, clientSecret);
 
-                    // 1. Try to create the user or retrieve the existing one
-                    string userId = ProvisionUserInGraph(httpClient, accessToken, email, contact, domain, tracer);
-
-                    // 2. Add to security group if configured
-                    if (!string.IsNullOrEmpty(groupId) && !string.IsNullOrEmpty(userId))
+                    // If the portal-enabled flag is explicitly false -> remove from group (if configured)
+                    if (isPortalEnabled.HasValue && isPortalEnabled.Value == false)
                     {
-                        AddUserToGroup(httpClient, accessToken, userId, groupId, tracer);
+                        tracer.Trace($"Portal flag is false for {email}. Ensuring user is removed from configured group (if any). ");
+                        if (!string.IsNullOrEmpty(groupId))
+                        {
+                            RemoveUserFromGroup(httpClient, accessToken, email, groupId, tracer);
+                            // Also attempt to delete the user from Entra entirely
+                            DeleteUserFromGraph(httpClient, accessToken, email, tracer);
+                        }
+                    }
+                    else
+                    {
+                        // Default or explicit true: create user or fetch existing and add to group if configured
+                        string userId = ProvisionUserInGraph(httpClient, accessToken, email, contact, domain, tracer);
+
+                        if (!string.IsNullOrEmpty(groupId) && !string.IsNullOrEmpty(userId))
+                        {
+                            AddUserToGroup(httpClient, accessToken, userId, groupId, tracer);
+                        }
                     }
                 }
             }
@@ -116,6 +249,9 @@ namespace CIAMPlugins
         private string ProvisionUserInGraph(HttpClient client, string accessToken, string email, Entity contact, string domain, ITracingService tracer)
         {
             client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
+
+            // Escape single quotes in email when used in OData filters
+            string safeEmail = (email ?? string.Empty).Replace("'", "''");
 
             // Microsoft Graph requires givenName and surname (1-64 characters)
             string firstName = contact.GetAttributeValue<string>("firstname");
@@ -166,7 +302,93 @@ namespace CIAMPlugins
                 (responseBody.Contains("proxyAddresses") || responseBody.Contains("Another object with the same value for property proxyAddresses")))
             {
                 tracer.Trace($"Warning: Proxy address conflict detected for {email}. Details: {responseBody}");
-                // Return null to indicate the user was not created here, but allow the plugin to complete without throwing
+
+                // Try to locate existing user by the 'mail' property first, then otherMails, then identities
+                try
+                {
+                    // Search by mail
+                    var mailFilterUrl = $"https://graph.microsoft.com/v1.0/users?$filter=mail eq '{safeEmail}'&$select=id";
+                    var mailGet = client.GetAsync(mailFilterUrl).Result;
+                    if (mailGet.IsSuccessStatusCode)
+                    {
+                        var mailResult = JObject.Parse(mailGet.Content.ReadAsStringAsync().Result);
+                        var mailUsers = (JArray)mailResult["value"];
+                        if (mailUsers != null && mailUsers.Count > 0)
+                        {
+                            return mailUsers[0]["id"].ToString();
+                        }
+                    }
+
+                    // Search by otherMails
+                    var otherMailsFilter = $"https://graph.microsoft.com/v1.0/users?$filter=otherMails/any(m:m eq '{safeEmail}')&$select=id";
+                    var otherGet = client.GetAsync(otherMailsFilter).Result;
+                    if (otherGet.IsSuccessStatusCode)
+                    {
+                        var otherResult = JObject.Parse(otherGet.Content.ReadAsStringAsync().Result);
+                        var otherUsers = (JArray)otherResult["value"];
+                        if (otherUsers != null && otherUsers.Count > 0)
+                        {
+                            return otherUsers[0]["id"].ToString();
+                        }
+                    }
+
+                    // Fallback: try identities filter (email identity)
+                    var identitiesFilterLocal = $"https://graph.microsoft.com/v1.0/users?$filter=identities/any(id:id/issuerAssignedId eq '{safeEmail}')&$select=id";
+                    var idGetLocal = client.GetAsync(identitiesFilterLocal).Result;
+                    if (idGetLocal.IsSuccessStatusCode)
+                    {
+                        var idResultLocal = JObject.Parse(idGetLocal.Content.ReadAsStringAsync().Result);
+                        var idUsersLocal = (JArray)idResultLocal["value"];
+                        if (idUsersLocal != null && idUsersLocal.Count > 0)
+                        {
+                            return idUsersLocal[0]["id"].ToString();
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    tracer.Trace($"Warning: Exception while searching for existing user after proxyAddresses conflict: {ex.Message}");
+                }
+
+                // If nothing found, log and allow save to continue without throwing
+                tracer.Trace($"Info: Could not locate existing user for {email} after proxyAddresses conflict. Details: {responseBody}");
+                return null;
+            }
+
+            // Specific handling for userPrincipalName conflict: attempt to locate existing user and continue
+            if (response.StatusCode == HttpStatusCode.BadRequest &&
+                (responseBody.Contains("userPrincipalName") || responseBody.Contains("Another object with the same value for property userPrincipalName")))
+            {
+                tracer.Trace($"Warning: userPrincipalName conflict detected for {email}. Attempting to locate existing user. Details: {responseBody}");
+
+                // Try finding by userPrincipalName (escape quotes)
+                var upnFilterUrl = $"https://graph.microsoft.com/v1.0/users?$filter=userPrincipalName eq '{safeEmail}'&$select=id";
+                var upnGet = client.GetAsync(upnFilterUrl).Result;
+                if (upnGet.IsSuccessStatusCode)
+                {
+                    var upnResult = JObject.Parse(upnGet.Content.ReadAsStringAsync().Result);
+                    var upnUsers = (JArray)upnResult["value"];
+                    if (upnUsers != null && upnUsers.Count > 0)
+                    {
+                        return upnUsers[0]["id"].ToString();
+                    }
+                }
+
+                // Fallback: try identities filter (email identity)
+                var identitiesFilter = $"https://graph.microsoft.com/v1.0/users?$filter=identities/any(id:id/issuerAssignedId eq '{safeEmail}')&$select=id";
+                var idGet = client.GetAsync(identitiesFilter).Result;
+                if (idGet.IsSuccessStatusCode)
+                {
+                    var idResult = JObject.Parse(idGet.Content.ReadAsStringAsync().Result);
+                    var idUsers = (JArray)idResult["value"];
+                    if (idUsers != null && idUsers.Count > 0)
+                    {
+                        return idUsers[0]["id"].ToString();
+                    }
+                }
+
+                // If nothing found, log and allow save to continue without throwing
+                tracer.Trace($"Info: Could not locate existing user for {email} after userPrincipalName conflict. Details: {responseBody}");
                 return null;
             }
 
@@ -179,7 +401,7 @@ namespace CIAMPlugins
                 tracer.Trace($"User {email} already exists or has a conflict. Fetching existing ID.");
 
                 // Fetch existing user ID via filter to continue the process
-                var filterUrl = $"https://graph.microsoft.com/v1.0/users?$filter=identities/any(id:id/issuerAssignedId eq '{email}')&$select=id";
+                var filterUrl = $"https://graph.microsoft.com/v1.0/users?$filter=identities/any(id:id/issuerAssignedId eq '{safeEmail}')&$select=id";
                 var getResponse = client.GetAsync(filterUrl).Result;
 
                 if (getResponse.IsSuccessStatusCode)
@@ -220,6 +442,83 @@ namespace CIAMPlugins
             else
             {
                 tracer.Trace($"Warning: Could not add user to group. Status: {response.StatusCode}. Response: {responseBody}");
+            }
+        }
+
+        private void RemoveUserFromGroup(HttpClient client, string accessToken, string email, string groupId, ITracingService tracer)
+        {
+            try
+            {
+                client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
+
+                // Escape single quotes in email when used in OData filters
+                var safeEmail = (email ?? string.Empty).Replace("'", "''");
+
+                // Try locating the user by mail, then otherMails, then identities
+                JArray users = null;
+
+                // Search by mail
+                var mailFilterUrl = $"https://graph.microsoft.com/v1.0/users?$filter=mail eq '{safeEmail}'&$select=id";
+                var mailGet = client.GetAsync(mailFilterUrl).Result;
+                if (mailGet.IsSuccessStatusCode)
+                {
+                    var mailResult = JObject.Parse(mailGet.Content.ReadAsStringAsync().Result);
+                    users = (JArray)mailResult["value"];
+                }
+
+                // If not found, search by otherMails
+                if (users == null || users.Count == 0)
+                {
+                    var otherMailsFilter = $"https://graph.microsoft.com/v1.0/users?$filter=otherMails/any(m:m eq '{safeEmail}')&$select=id";
+                    var otherGet = client.GetAsync(otherMailsFilter).Result;
+                    if (otherGet.IsSuccessStatusCode)
+                    {
+                        var otherResult = JObject.Parse(otherGet.Content.ReadAsStringAsync().Result);
+                        users = (JArray)otherResult["value"];
+                    }
+                }
+
+                // If still not found, fallback to identities lookup
+                if (users == null || users.Count == 0)
+                {
+                    var identitiesFilterLocal = $"https://graph.microsoft.com/v1.0/users?$filter=identities/any(id:id/issuerAssignedId eq '{safeEmail}')&$select=id";
+                    var idGetLocal = client.GetAsync(identitiesFilterLocal).Result;
+                    if (idGetLocal.IsSuccessStatusCode)
+                    {
+                        var idResultLocal = JObject.Parse(idGetLocal.Content.ReadAsStringAsync().Result);
+                        users = (JArray)idResultLocal["value"];
+                    }
+                }
+
+                if (users == null || users.Count == 0)
+                {
+                    tracer.Trace($"Info: No Entra user found for {email}; nothing to remove from group.");
+                    return;
+                }
+
+                var userId = users[0]["id"].ToString();
+
+                var requestUrl = $"https://graph.microsoft.com/v1.0/groups/{groupId}/members/{userId}/$ref";
+                var response = client.DeleteAsync(requestUrl).Result;
+
+                if (response.IsSuccessStatusCode)
+                {
+                    tracer.Trace($"Success: User {email} removed from group {groupId}.");
+                }
+                else if (response.StatusCode == HttpStatusCode.NotFound)
+                {
+                    tracer.Trace($"Info: User {email} is not a member of group {groupId}.");
+                }
+                else
+                {
+                    var responseBody = response.Content.ReadAsStringAsync().Result;
+                    tracer.Trace($"Warning: Could not remove user {email} from group. Status: {response.StatusCode}. Response: {responseBody}");
+                }
+            }
+            catch (Exception ex)
+            {
+                // Do not let removal errors abort the plugin; log and continue
+                tracer.Trace($"Warning: Exception while removing user {email} from group {groupId}: {ex.Message}");
             }
         }
     }
