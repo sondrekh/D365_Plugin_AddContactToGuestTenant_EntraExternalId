@@ -31,6 +31,7 @@ namespace CIAMPlugins
             // Ensure TLS 1.2 for communication with Microsoft Graph
             ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12;
 
+            // Prevent infinite loops
             if (context.Depth > 1) return;
 
             if (string.IsNullOrEmpty(_secureConfig))
@@ -42,7 +43,7 @@ namespace CIAMPlugins
             if (!context.InputParameters.Contains("Target") || !(context.InputParameters["Target"] is Entity targetEntity))
                 return;
 
-            // Retrieve data from PostImage to ensure all fields are available, or fallback to Target
+            // Use PostImage for robust data access, fallback to Target
             Entity contact = context.PostEntityImages.Contains("PostImage")
                 ? context.PostEntityImages["PostImage"]
                 : targetEntity;
@@ -60,7 +61,7 @@ namespace CIAMPlugins
                 string tenantId = config["tenantId"]?.ToString();
                 string clientId = config["clientId"]?.ToString();
                 string clientSecret = config["clientSecret"]?.ToString();
-                string domain = config["tenantDomain"]?.ToString(); // e.g., "yourtenant.onmicrosoft.com"
+                string domain = config["tenantDomain"]?.ToString();
                 string groupId = config["groupId"]?.ToString();
 
                 if (new[] { tenantId, clientId, clientSecret, domain }.Any(string.IsNullOrEmpty))
@@ -72,11 +73,11 @@ namespace CIAMPlugins
 
                 using (var httpClient = new HttpClient())
                 {
-                    httpClient.Timeout = TimeSpan.FromSeconds(60); // Prevent plugin from hanging indefinitely
+                    httpClient.Timeout = TimeSpan.FromSeconds(60);
 
                     string accessToken = GetGraphAccessToken(httpClient, tenantId, clientId, clientSecret);
 
-                    // 1. Create or retrieve the existing user
+                    // 1. Attempt to create the user
                     string userId = ProvisionUserInGraph(httpClient, accessToken, email, contact, domain, tracer);
 
                     // 2. Add to security group if configured
@@ -85,6 +86,11 @@ namespace CIAMPlugins
                         AddUserToGroup(httpClient, accessToken, userId, groupId, tracer);
                     }
                 }
+            }
+            catch (InvalidPluginExecutionException ex)
+            {
+                // Directly re-throw to ensure the UI catches the user-friendly message
+                throw ex;
             }
             catch (Exception ex)
             {
@@ -102,7 +108,7 @@ namespace CIAMPlugins
             var content = response.Content.ReadAsStringAsync().Result;
 
             if (!response.IsSuccessStatusCode)
-                throw new Exception($"Graph Authentication failed: {response.ReasonPhrase}");
+                throw new Exception($"Graph Authentication failed: {response.ReasonPhrase}. Details: {content}");
 
             return JObject.Parse(content)["access_token"].ToString();
         }
@@ -141,20 +147,18 @@ namespace CIAMPlugins
                 return JObject.Parse(responseBody)["id"].ToString();
             }
 
-            // Handle case where user already exists (409 Conflict)
+            // Handle standard Conflict (409)
             if (response.StatusCode == HttpStatusCode.Conflict)
             {
-                tracer.Trace("User already exists. Fetching existing ID via filter.");
-                // Use filter on identities to find the correct object in CIAM
-                var filterUrl = $"https://graph.microsoft.com/v1.0/users?$filter=identities/any(id:id/issuerAssignedId eq '{email}')&$select=id";
-                var getResponse = client.GetAsync(filterUrl).Result;
+                tracer.Trace($"Conflict: User with email {email} already exists.");
+                throw new InvalidPluginExecutionException($"A user with the email address '{email}' is already registered in Entra External Id.");
+            }
 
-                if (getResponse.IsSuccessStatusCode)
-                {
-                    var searchResult = JObject.Parse(getResponse.Content.ReadAsStringAsync().Result);
-                    var users = (JArray)searchResult["value"];
-                    if (users.Count > 0) return users[0]["id"].ToString();
-                }
+            // Handle BadRequest (400) that contains "already exists" or "ObjectConflict"
+            if (response.StatusCode == HttpStatusCode.BadRequest && responseBody.Contains("already exists"))
+            {
+                tracer.Trace($"BadRequest Conflict: Object already exists for {email}. Raw response: {responseBody}");
+                throw new InvalidPluginExecutionException($"A user with the email address '{email}' is already registered in Entra External Id.");
             }
 
             throw new Exception($"Failed to handle user in Graph: {response.StatusCode} - {responseBody}");
@@ -164,14 +168,12 @@ namespace CIAMPlugins
         {
             client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
 
-            // Request URL for adding a member to a group via $ref
             var requestUrl = $"https://graph.microsoft.com/v1.0/groups/{groupId}/members/$ref";
-
-            // Microsoft Graph requires the @odata.id property in the JSON payload
             string rawPayload = "{\"@odata.id\": \"https://graph.microsoft.com/v1.0/directoryObjects/" + userId + "\"}";
             var content = new StringContent(rawPayload, Encoding.UTF8, "application/json");
 
             var response = client.PostAsync(requestUrl, content).Result;
+            string responseBody = response.Content.ReadAsStringAsync().Result;
 
             if (response.IsSuccessStatusCode)
             {
@@ -181,9 +183,14 @@ namespace CIAMPlugins
             {
                 tracer.Trace("Info: User might already be a member of the group.");
             }
+            else if (response.StatusCode == HttpStatusCode.Forbidden)
+            {
+                tracer.Trace($"Critical Error: 403 Forbidden. Response: {responseBody}");
+                throw new Exception($"Graph API Forbidden (403): {responseBody}");
+            }
             else
             {
-                tracer.Trace($"Warning: Could not add user to group. Status: {response.StatusCode}");
+                tracer.Trace($"Warning: Could not add user to group. Status: {response.StatusCode}. Response: {responseBody}");
             }
         }
     }
