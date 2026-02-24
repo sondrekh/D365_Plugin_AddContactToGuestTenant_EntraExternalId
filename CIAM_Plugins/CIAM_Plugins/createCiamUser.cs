@@ -74,6 +74,7 @@ namespace CIAMPlugins
 
                 // 1. Acquire Access Token from Microsoft Identity Platform
                 string accessToken = GetGraphAccessToken(tenantId, clientId, clientSecret, tracer);
+                tracer.Trace($"Access token successfully acquired from Microsoft Identity Platform. {accessToken}");
 
                 // 2. Create the User in Microsoft Graph
                 ProvisionUserInGraph(accessToken, email, contact, domain, tracer);
@@ -121,6 +122,7 @@ namespace CIAMPlugins
                     displayName = $"{firstName} {lastName}",
                     givenName = firstName,
                     surname = lastName,
+                    mail = email, 
                     passwordProfile = new { 
                         forceChangePasswordNextSignIn = false, 
                         password = Guid.NewGuid().ToString("N") + "!" + Guid.NewGuid().ToString("N").Substring(0,4).ToUpper() // Random secure password
