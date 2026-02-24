@@ -12,6 +12,9 @@ Denne pluginnen automatiserer opprettelsen av brukere i **Microsoft Entra Extern
 * **Robust:** Håndterer "Race Conditions" (409 Conflict) og dype rekursive kall i Dataverse.
 * **Automatisert Gruppetilgang:** Kan automatisk legge brukere til i en spesifisert sikkerhetsgruppe (Security Group) for applikasjonstilgang.
 * **Asynkron vennlig:** Designet for å kjøre i bakgrunnen uten å påvirke brukerens hastighet i portalen.
+* **Fjernbruker-støtte:** Hvis en konfigurert boolean-felt (via unsecure config) eksplisitt settes til `false`, fjerner pluginen brukeren fra den konfigurerte gruppen og forsøker å slette brukeren fra Entra.
+* **Konfigurerbar portal-flag:** Feltnavnet som indikerer om en kontakt skal være portal-aktiv kan settes i Unsecure Configuration (se Konfigurasjon).
+* **PostImage-fallback og TLS:** Leser data fra `PostImage` når tilgjengelig (fallback til Target), og tvinger TLS 1.2 for Graph-kommunikasjon.
 
 ---
 
@@ -42,6 +45,20 @@ Limes inn i feltet for **Secure Configuration** ved registrering av Step i Plugi
   "groupId": "OPTIONAL_SECURITY_GROUP_GUID"
 }
 ``` 
+
+Hvis du ønsker at pluginen skal bruke et eget boolean-felt på kontakten for å styre portal-tilgang (f.eks. `new_isEnabledForPortal`), lim inn følgende i **Unsecure Configuration** når du registerer steppet:
+
+```json
+{
+  "isEnabledForPortalField": "new_isEnabledForPortal"
+}
+```
+
+Når dette er konfigurert, vil en eksplisitt `false` verdi på dette feltet gjøre at pluginen:
+- fjerner brukeren fra den konfigurerte sikkerhetsgruppen (hvis `groupId` er satt)
+- forsøker å slette brukeren fra Entra
+
+Hvis `isEnabledForPortalField` ikke er angitt, oppfører pluginen seg som før (opprett/oppdater bruker og legg til i gruppe ved behov).
 
 ## 📦 Installasjon og Oppsett
 
@@ -84,6 +101,8 @@ Hvis synkroniseringen ikke fungerer som forventet, må du aktivere og sjekke **P
 * **Årsak:** App-registreringen i Azure mangler nødvendige tillatelser.
 * **Løsning:** Kontroller at `User.ReadWrite.All` og `GroupMember.ReadWrite.All` er lagt til i Microsoft Graph, og at du har klikket på **"Grant admin consent"**.
 
+Merk: 403 kan også oppstå ved forsøk på å slette en bruker eller oppdatere gruppe-medlemskap hvis appen mangler nødvendige Directory-tillatelser. Pluginen vil logge detaljer i trace-loggen ved slike operasjoner.
+
 #### 🛑 409 Conflict
 * **Årsak:** Brukeren eksisterer allerede i Entra ID (CIAM) med denne e-posten.
 * **Løsning:** Dette er håndtert i koden. Pluginnen vil automatisk forsøke å hente den eksisterende brukerens ID for å oppdatere gruppemedlemskap i stedet for å feile.
@@ -99,3 +118,5 @@ Hvis synkroniseringen ikke fungerer som forventet, må du aktivere og sjekke **P
 #### 🛑 Plugin Timeout
 * **Årsak:** Ofte forårsaket av dype rekursive kall eller nettverkstreghet mot Graph API.
 * **Løsning:** Sørg for at pluginnen kjører **Asynchronous**. Dette gir pluginnen mer tid til å fullføre (opptil 2 minutter) uten at brukeren får feilmelding i nettleseren.
+
+Denne pluginen håndterer også vanlige konflikt-tilfeller fra Graph (f.eks. `proxyAddresses` eller `userPrincipalName` konflikter) ved å forsøke å finne eksisterende bruker og fortsette uten å rulle tilbake CRM-operasjonen.
