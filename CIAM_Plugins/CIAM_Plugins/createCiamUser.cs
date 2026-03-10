@@ -115,7 +115,7 @@ namespace CIAMPlugins
             ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12;
 
             // Prevent infinite loops
-            if (context.Depth > 1) return;
+            if (context.Depth > 2) return;
 
             if (string.IsNullOrEmpty(_secureConfig))
             {
